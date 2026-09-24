@@ -8,6 +8,60 @@
 
 脚本支持旧版 JSON 配置，以及新版 `VariationsSeedV2` 中的国家元数据。曾在 Windows、Edge **153.0.4234.32** 环境下实际修复 Copilot 入口；这不代表所有版本、账户和网络环境都能得到相同结果。
 
+## v2.1.0：网页能用，但侧栏提示地区不可用
+
+侧栏和网页入口并不相同。微软列出的消费版侧栏入口是 `https://edgeservices.bing.com/edgesvc/shell`；本机 Edge 153 的程序中还包含 `https://edgeservices.bing.com/edgesvc/userstatus` 资格接口。[微软侧栏加载排障文档](https://learn.microsoft.com/en-us/troubleshoot/microsoft-edge/experience/copilot-chat-loading-issues)
+
+本次对同一资格接口进行了匿名请求对比：直连的 `UserIpEligible`、`UserRegionEligible` 均为 False；通过本机 v2rayN SOCKS5 `127.0.0.1:10808` 时均为 True。这确认了**资格结果随请求出口变化**，但没有直接测量真实侧栏的出口，也不能仅凭此断言 SwitchyOmega 存在缺陷。浏览器扩展控制的代理设置与其他网络上下文可能不同。
+
+针对“v2rayN + SwitchyOmega，网页可用但侧栏拒绝”的使用方式：
+
+1. 先启动 v2rayN，保持可正常使用网页聊天的节点。
+2. 启动脚本，选择 **`9`**。代理地址默认 `socks5://127.0.0.1:10808`，按回车使用。检查直连和代理的地区资格差异。
+3. 保存网页工作，选择 **`8`**，代理地址按回车。脚本先验证本机 SOCKS5 握手，再修复并重开 Edge，加入 `--proxy-server=socks5://127.0.0.1:10808` 和实验地区参数。若关闭失败，可按提示选择强制重试。
+4. 在同一个 Edge 配置里打开 `https://edgeservices.bing.com/edgesvc/userstatus`，核对两个地区资格字段，再重新打开侧栏。浏览器响应可能含账号信息，**不要公开完整响应**。
+
+此启动代理影响本次 Edge 进程的浏览器网络请求，不只影响 Copilot。它不改系统代理、v2rayN、SwitchyOmega 或快捷方式；完全退出后从普通快捷方式启动不继承。组织策略或代理扩展可能影响最终生效设置，启动参数出现于 `edge://version` 也不等于已经证明实际路由；仍有问题时，可暂时停用代理扩展做对比，再恢复原设置。[Chromium 代理配置说明](https://chromium.googlesource.com/chromium/src/+/HEAD/net/docs/proxy.md)
+
+菜单 **`7`** 现已增加侧栏 shell 和匿名资格检查。`UserSignedIn=False` 在匿名检查中是正常结果，不能据此判断浏览器未登录。接口并非稳定公开 API；只识别已知布尔字段，格式不符时报告无法判断。脚本不会把服务端返回值写成 True。
+
+自动化示例：
+
+```powershell
+# 对比直连与指定 SOCKS5；不关闭浏览器、不修改配置
+python patch_edge_copilot.py --check-network --edge-proxy socks5://127.0.0.1:10808
+
+# 修复后带代理和实验地区参数重新启动
+python patch_edge_copilot.py --apply --patch-seed --profile Default --close-edge --restart-edge --startup-country --edge-proxy socks5://127.0.0.1:10808
+```
+
+仅支持无认证的本机 SOCKS5：`127.0.0.1`、`localhost` 或 `[::1]` 加端口。SOCKS5 资格对比需要可执行的 `curl`，脚本会检查是否存在；没有 curl 不影响 Edge 的代理启动。未新增 Python 依赖。**当前已验证代理请求通过地区资格检查；真实侧栏聊天恢复仍需使用者验证。**
+
+## v2.0.0 更新（2026-09-23）
+
+针对 Edge **153.0.4234.48** 上“按钮存在但聊天不可用”和“关窗后后台进程残留”增加诊断与处理：
+
+- **菜单内强制重试**：正常关闭失败后，可以选择 `y` 强制关闭并重试，保留通道、配置及重开选择；默认 `N`。无需重新输入长命令。仅关闭失败会出现该选项，配置损坏等错误不会触发强制关闭。
+- **菜单 `6`：修复并带目标地区启动**。同步本地配置后，使用 `--variations-override-country=us` 启动新进程（CLI 用 `--country` 选择其他地区）。即使文件已经符合目标，也必须退出旧进程才能应用启动参数。
+- **菜单 `7`：聊天入口连通性诊断**。主动检查 `copilot.com`、`copilot.microsoft.com` 和 `copilot.cloud.microsoft`，区分 DNS、TLS、超时、HTTP 错误与重定向；不携带浏览器登录信息、不读取响应正文、不跟随重定向。
+- **资格诊断**：区分入口开关、MSA 资格缓存和新版 `chat_v2` 检查时间；不将时间戳误当布尔开关，也不修改账号资格。
+
+本次本机排查发现，入口开关和 MSA 缓存均为 True，但 `Local State` 与 `VariationsSeedV2.session_country` 再次变为 CN；关窗后确实仍有 renderer 等活动进程。这些是确认的本地状态，**尚不能单独证明聊天不可用的服务端原因，也未验证本版已经恢复实际聊天**。
+
+地区启动参数来自 Chromium 的实验分组逻辑，**只在本次浏览器进程中生效**；完全退出后用普通快捷方式打开不会继承，也不会阻止磁盘缓存回写。它不改变网络出口、账户地区或服务端资格，不是永久解锁。可在 `edge://version` 的命令行中检查参数是否传入。[Chromium 地区读取逻辑](https://github.com/chromium/chromium/blob/main/components/variations/service/variations_field_trial_creator.cc)
+
+按钮存在但聊天打不开时，先用 `7` 检查，并在同一个 Edge 配置中直接打开 `https://copilot.com/` 测试聊天；地区缓存反复回写时可尝试 `6`。微软目前的文档也列出了 `copilot.cloud.microsoft` 入口，因此需要核对实际跳转域名的网络可用性。[微软 Copilot 入口说明](https://support.microsoft.com/en-us/microsoft-365-copilot/what-is-microsoft-copilot-app)
+
+对应自动化命令：
+
+```powershell
+python patch_edge_copilot.py --apply --patch-seed --profile Default --close-edge --restart-edge --startup-country
+python patch_edge_copilot.py --check-network
+python patch_edge_copilot.py --version
+```
+
+如果正常关闭失败，自动化命令仍需显式添加 `--force-close`；CLI 不会弹出确认提示。强制关闭先结束主进程，再清理子进程，并再次检查新出现的残留。**执行前保存网页工作，强制关闭可能丢失未保存内容。**
+
 ## 目录
 
 - [功能](#功能)
@@ -85,15 +139,19 @@ python patch_edge_copilot.py
 ## 交互菜单
 
 ```text
-========== Edge Copilot 修复工具 ==========
+========== Edge Copilot 修复工具 v2.1.0 ==========
 当前配置：正式版 / Default
 1. 修复 Copilot（自动关闭 Edge）
 2. 预览修复内容
 3. 只读诊断
 4. 查看 Edge 进程
 5. 更换浏览器通道 / 配置目录
+6. 修复并带目标地区启动（自动关闭并重开 Edge，用于地区反复回写）
+7. 网页/侧栏连通性与地区资格诊断（主动联网，只读）
+8. 修复并通过本机 SOCKS5 代理重开 Edge（默认端口 10808）
+9. 对比直连与本机 SOCKS5 的侧栏地区资格（只读）
 0. 退出
-请选择操作 [0-5]：
+请选择操作 [0-9]：
 ```
 
 | 选项 | 行为 |
@@ -103,6 +161,10 @@ python patch_edge_copilot.py
 | `3` | 只读检查当前配置，Windows 下还会检查相关注册表策略和代理设置状态 |
 | `4` | 列出当前用户的活动 Edge 进程，帮助定位后台残留 |
 | `5` | 选择通道或自定义 User Data 目录，再指定配置目录名 |
+| `6` | 修复并完全重启 Edge，传入仅本次进程生效的实验地区参数；此操作必定请求重开 |
+| `7` | 检查网页/侧栏入口，并读取匿名资格接口中有限的布尔字段；不读写浏览器配置 |
+| `8` | 修复并通过指定本机 SOCKS5 重启，启动前先验证代理握手；此操作请求重开 |
+| `9` | 在普通网络诊断后，对比强制直连与指定 SOCKS5 的匿名地区资格 |
 | `0` | 退出程序 |
 
 操作结束后按回车返回菜单。目标选择仅保留到本次程序退出，不写入额外的设置文件。
@@ -113,7 +175,7 @@ python patch_edge_copilot.py
 - 输入 `Profile 1` 等目录名：只处理该配置的 `Preferences`。
 - 输入 `*`：处理该用户数据目录下全部已有的常规配置。
 
-这里填写的是**磁盘目录名**，不是 Edge 界面中的账户昵称。菜单不会默认使用 `--force-close`。
+这里填写的是**磁盘目录名**，不是 Edge 界面中的账户昵称。菜单不会默认使用 `--force-close`；关闭失败后输入 `y` 才会强制重试。普通修复 `1` 仍可选择不重开。
 
 ## 命令行用法
 
@@ -204,6 +266,10 @@ python patch_edge_copilot.py --apply --profile Default --close-edge
 | 参数 | 含义 | 默认值 / 说明 |
 | --- | --- | --- |
 | `-h`, `--help` | 显示帮助并退出 | 不执行修复 |
+| `--version` | 显示工具版本并退出 | 不执行修复 |
+| `--check-network` | 主动联网检查网页、侧栏及匿名资格 | 无需本地 Edge 配置；返回 0 表示检查完成，不表示服务可用 |
+| `--edge-proxy` | 本机无认证 SOCKS5 地址 | 配合 `--check-network` 对比资格，或配合 `--apply --restart-edge` 启动 Edge 代理；例 `socks5://127.0.0.1:10808` |
+| `--startup-country` | 重开时传入实验地区参数 | 需 `--apply --restart-edge`；有活动进程时还需 `--close-edge` 或手动退出 |
 | `--diagnose` | 只读诊断 | 仅提供其他非操作参数时的默认模式 |
 | `--dry-run` | 预览计划修改 | 不写文件、不关闭浏览器 |
 | `--apply` | 备份后应用补丁 | 显式启用写入 |
@@ -221,11 +287,11 @@ python patch_edge_copilot.py --apply --profile Default --close-edge
 
 组合规则：
 
-- `--diagnose`、`--dry-run`、`--apply`、`--list-processes` 互斥。
+- `--diagnose`、`--dry-run`、`--apply`、`--list-processes`、`--check-network` 互斥。
 - `--restart-edge` 和 `--no-restart-edge` 互斥。
 - `--close-edge`、`--force-close`、`--restart-edge` 不能用于只读操作。
 - 未指定自定义 User Data 时，`--edge-exe` 不能与 `--channel all` 同用。
-- `--country` 只改变本地缓存，不改变实际网络出口或账户地区。
+- `--country` 指定本地缓存和可选启动参数的目标，不改变实际网络出口或账户地区。
 
 ## 自动化执行
 
@@ -269,6 +335,7 @@ exit $resultCode
 | `0` | 本次操作完成，或没有需要修改的配置 |
 | `1` | 配置读取、进程处理、写入或重新启动等步骤失败 |
 | `2` | 命令行参数无效 |
+| `3` | 请求关闭 Edge 后仍未确认退出，未写入配置；菜单可选择强制重试 |
 | `130` | 交互菜单中按 Ctrl+C 取消 |
 
 `0` 表示脚本完成，不表示 Copilot 服务一定可用。菜单退出时返回的是菜单退出状态，不能用它代替每次修复的结果；自动化请使用参数模式。
@@ -321,6 +388,8 @@ Windows 下，如果只剩明确以 `--no-startup-window` 启动的后台实例�
 
 如果仍有网页、扩展页面、无头自动化或未知类型进程，脚本不会自动强制结束，而是列出 PID 和进程类型。可以在任务管理器的“详细信息”页核对。
 
+`renderer` 不一定代表可见网页，也可能属于后台页面或扩展。v2 在正常关闭失败时会提供菜单内的强制重试，默认拒绝；确认已保存工作后输入 `y` 即可继续。强制重试保留本次的配置和重开选项。
+
 **关闭操作针对当前用户的全部 Edge 浏览器进程，包括其他通道，不受 `--profile` 限制。** 如果只想处理配置而不让脚本关闭浏览器，请先手动完全退出 Edge，再省略 `--close-edge`。
 
 确认已保存工作、确实需要强制关闭时：
@@ -336,6 +405,7 @@ python patch_edge_copilot.py --apply --patch-seed --profile Default --close-edge
 - 菜单修复会询问是否重开，默认选“是”；命令行默认不重开。
 - 重开使用目标通道、用户数据目录和指定配置。重复指定不同 `--profile` 时，会分别发送打开窗口请求。
 - 配置已满足、无需修改时，如果指定 `--restart-edge`，仍会请求打开窗口。
+- 如果指定 `--startup-country` 或 `--edge-proxy`，即使配置已满足也会要求退出旧进程再启动，避免参数被旧实例忽略；启动前再次发现进程则停止启动并报错。
 - 修复步骤失败时不自动重开。若仅启动浏览器失败，配置修改可能已经完成，终端会明确提示。
 - 打开窗口不等于恢复之前的所有标签页；会话恢复行为由 Edge 自身设置决定。
 - 程序报告的是启动请求已发送，不对窗口最终显示或 Copilot 响应作自动判断。
@@ -427,7 +497,11 @@ python patch_edge_copilot.py --list-processes
 
 ### 重启后地区又变回去了
 
-浏览器或服务器后续更新可能重新写入地区缓存。可重新诊断确认，但不能把反复执行补丁当作永久解决方案。脚本不锁定配置文件、不禁用浏览器更新。
+浏览器或服务器后续更新可能重新写入地区缓存。可以尝试菜单 `6` 的地区启动方式；它只覆盖本次进程使用的实验地区，不阻止磁盘回写，不是永久解决方案。脚本不锁定配置文件、不禁用浏览器更新。
+
+### 按钮存在，但聊天打不开或提示不可用
+
+先选择菜单 `7`。此检查使用 Python 的网络配置，可能与 Edge 的代理、PAC、扩展或 VPN 路由不同；HTTP 200 只表示入口有响应，403 也不能单独证明地区封锁。重定向目标仅显示主机名，目标可用性仍未知。请在同一个 Edge 配置中访问 `copilot.com`，记录实际跳转域名和错误文字，再区分网络、登录和服务端资格问题。MSA 缓存为 True 也不等于实际请求已获授权。
 
 ### 自动重开时提示找不到 Edge 程序
 
@@ -438,10 +512,10 @@ python patch_edge_copilot.py --list-processes
 如果同时下载了仓库中的测试文件，可以运行：
 
 ```powershell
-python -m unittest -v test_patch_edge_copilot.py test_edge_copilot_seed.py test_edge_shutdown.py test_edge_menu.py
+python -m unittest -v test_patch_edge_copilot.py test_edge_copilot_seed.py test_edge_shutdown.py test_edge_menu.py test_edge_v2.py test_edge_sidebar.py
 ```
 
-当前已通过 **80 项自动化测试**，覆盖配置保留、坏文件保护、备份、并发写入检查、种子结构、进程退出、菜单和重开逻辑。自动化测试使用临时配置和模拟进程，不会操作真实 Edge 窗口。
+当前已通过 **116 项自动化测试**，覆盖配置保留、坏文件保护、备份、并发写入检查、种子结构、进程退出、菜单强制重试、地区/代理启动、SOCKS5 握手及匿名资格解析。自动化测试使用临时配置、模拟进程和模拟网络，不会操作真实 Edge 窗口。
 
 另已验证：只把主脚本复制到独立临时目录，仍能运行菜单、预览及模拟配置修复。测试文件不是运行工具所需的依赖。
 

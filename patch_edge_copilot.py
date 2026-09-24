@@ -26,13 +26,27 @@ import subprocess
 import sys
 import tempfile
 import time
+import socket
+import ssl
+import urllib.error
+import urllib.parse
+import urllib.request
 
 try:
     import psutil
 except ImportError:
     psutil = None
 
+VERSION = "2.1.0"
 MISSING = "<未设置>"
+COPILOT_URLS = ("https://copilot.com/", "https://copilot.microsoft.com/",
+                "https://copilot.cloud.microsoft/", "https://edgeservices.bing.com/edgesvc/shell")
+SIDEBAR_STATUS_URL = "https://edgeservices.bing.com/edgesvc/userstatus"
+SIDEBAR_STATUS_KEYS = ("UserIpEligible", "UserRegionEligible", "UserEligible",
+                       "UserSignedIn", "CodexEnabled")
+DEFAULT_EDGE_PROXY = "socks5://127.0.0.1:10808"
+SIDEBAR_POLICY_URLS = ("*", "edge://discover-chat", "edge://hub-app-store",
+                       "edge://commercial-copilot-chat", "chrome-untrusted://commercial-copilot-chat")
 COPILOT_EXTENSION = "ofefcgjbeghpigppfmkologfjadafddi"
 POLICY_NAMES = (
     "HubsSidebarEnabled", "Microsoft365CopilotChatIconEnabled",
@@ -53,6 +67,10 @@ class SeedFormatError(ValueError):
 
 class SeedCodecError(RuntimeError):
     """No supported Zstandard implementation is available."""
+
+
+class EdgeStillRunningError(RuntimeError):
+    """No configuration was written; the menu may offer an explicit force retry."""
 
 
 def _check_frame_input(raw):
@@ -602,7 +620,12 @@ def shutdown_edge(force=False, timeout=10):
         return []
     print("正在请求关闭当前用户的全部 Edge 窗口，等待进程退出……")
     if sys.platform == "win32":
-        windows_edge_windows(processes, close=True)
+        try:
+            windows_edge_windows(processes, close=True)
+        except OSError as exc:
+            if not force:
+                raise EdgeStillRunningError(str(exc)) from exc
+            print("无法发送正常关闭消息；将按已选择的强制关闭方式继续。")
     else:
         for process in processes:
             try:
@@ -629,14 +652,29 @@ def shutdown_edge(force=False, timeout=10):
             remaining = wait_for_edge_exit(1)
     if remaining and force:
         print("已指定 --force-close：强制结束剩余 Edge 进程。")
-        for process in remaining:
-            try:
-                process.kill()
-            except psutil.NoSuchProcess:
-                pass
-        remaining = wait_for_edge_exit(timeout)
+        # Stop browser roots first so they cannot replace killed renderers.
+        # Refresh once for children created while the original snapshot was read.
+        for attempt in range(2):
+            ordered = []
+            for process in remaining:
+                try:
+                    child = any(arg.startswith("--type=") for arg in process.cmdline())
+                    ordered.append((child, process))
+                except psutil.NoSuchProcess:
+                    continue
+            for _, process in sorted(ordered, key=lambda item: item[0]):
+                try:
+                    process.kill()
+                except psutil.NoSuchProcess:
+                    pass
+            remaining = wait_for_edge_exit(timeout)
+            if not remaining:
+                break
     if remaining:
-        raise RuntimeError("Edge 仍有以下活动进程，未写入任何配置：\n{}\n"
+        if sys.platform == "win32" and not windows_edge_windows(remaining):
+            print("已无可见 Edge 窗口，但仍有后台进程；renderer 也可能属于扩展或后台页面。")
+            print("无法仅凭进程类型确认是否有未保存内容；菜单可选择强制关闭后重试。")
+        raise EdgeStillRunningError("Edge 仍有以下活动进程，未写入任何配置：\n{}\n"
                            "请在任务管理器的“详细信息”页按 PID 核对；保存网页工作后可使用 "
                            "--apply --patch-seed --close-edge --force-close。".format(
                                describe_edge_processes(remaining)))
@@ -667,14 +705,18 @@ def read_windows_diagnostics():
                 pass
             except OSError as exc:
                 print("提示：无法读取 {} 策略（{}）；请以 edge://policy 为准。".format(label, exc))
-        for name in ("ExtensionInstallBlocklist", "ExtensionInstallAllowlist"):
+        for name in ("ExtensionInstallBlocklist", "ExtensionInstallAllowlist",
+                     "EdgeSidebarAppUrlHostBlockList", "EdgeSidebarAppUrlHostAllowList"):
             try:
                 with winreg.OpenKey(hive, base + "\\" + name, 0,
                                     winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as key:
                     values = [winreg.EnumValue(key, i)[1] for i in range(winreg.QueryInfoKey(key)[1])]
-                    relevant = [v for v in values if v in ("*", COPILOT_EXTENSION)]
+                    allowed = SIDEBAR_POLICY_URLS if name.startswith("EdgeSidebar") else ("*", COPILOT_EXTENSION)
+                    relevant = [v for v in values if v in allowed]
                     if relevant:
                         policies.append((label, name, relevant))
+                    elif name.startswith("EdgeSidebar") and values:
+                        policies.append((label, name, "<已配置其他规则，请在 edge://policy 查看>"))
             except FileNotFoundError:
                 pass
             except OSError as exc:
@@ -706,6 +748,196 @@ def show_system_diagnostics():
             print("  Edge 153 更改了 PAC 的本机 IP 选择逻辑；若更新后失效，请检查 PAC/VPN 路由。")
     print("  Microsoft365CopilotChatIconEnabled 仅适用于 Entra 工作/学校配置。")
     print("  EdgeCopilotEnabled 仅适用于移动端，写入桌面注册表不能修复此问题。")
+
+
+class NoNetworkRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # Diagnose fixed public entry points only; do not follow login URLs.
+        return None
+
+
+def probe_copilot_url(url, timeout=6):
+    """Read response headers only; no browser cookies, account data or body."""
+    request = urllib.request.Request(url, headers={"User-Agent": "EdgeCopilotDiagnostics/" + VERSION})
+    opener = urllib.request.build_opener(NoNetworkRedirect())
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            code = response.status
+            headers = response.headers
+    except urllib.error.HTTPError as exc:
+        code, headers = exc.code, exc.headers
+        exc.close()
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        reason = getattr(exc, "reason", exc)
+        if isinstance(reason, socket.gaierror):
+            return "DNS 解析失败"
+        if isinstance(reason, ssl.SSLError):
+            return "TLS/证书检查失败"
+        if isinstance(reason, (socket.timeout, TimeoutError)):
+            return "连接或响应超时"
+        return "连接失败（网络、代理或连接被拒绝；不输出可能含凭据的异常原文）"
+    if 300 <= code < 400:
+        # Log a hostname, never redirect paths, query strings or credentials.
+        try:
+            host = urllib.parse.urlsplit(urllib.parse.urljoin(url, headers.get("Location", ""))).hostname
+        except ValueError:
+            host = None
+        return "HTTP {}，重定向到 {}（未跟随，目标可用性未知）".format(code, host or "未知主机")
+    if code in (401, 403, 429):
+        return "HTTP {}，访问受限/需要认证/限流；仅凭状态码不能判断地区或账号资格".format(code)
+    if code >= 400:
+        return "HTTP {}，入口返回错误".format(code)
+    return "HTTP {}，入口有响应；不代表聊天 API 或账号可用".format(code)
+
+
+def validate_edge_proxy(value):
+    match = re.fullmatch(r"socks5://(127\.0\.0\.1|localhost|\[::1\]):([0-9]{1,5})", value)
+    if not match or not 1 <= int(match[2]) <= 65535:
+        raise ValueError("请输入本机 SOCKS5 地址，例如 socks5://127.0.0.1:10808（不含账号密码）。")
+    return value
+
+
+def check_socks_proxy(proxy):
+    """Check the local SOCKS5 handshake before closing Edge or writing files."""
+    parsed = urllib.parse.urlsplit(validate_edge_proxy(proxy))
+    try:
+        with socket.create_connection((parsed.hostname, parsed.port), timeout=3) as connection:
+            connection.sendall(b"\x05\x01\x00")
+            reply = b""
+            while len(reply) < 2:
+                part = connection.recv(2 - len(reply))
+                if not part:
+                    break
+                reply += part
+        if reply != b"\x05\x00":
+            raise RuntimeError("该端口未接受无认证 SOCKS5 握手，请核对 v2rayN 的 SOCKS5 端口。")
+    except OSError as exc:
+        raise RuntimeError("无法连接本机 SOCKS5 代理，请先启动 v2rayN 并核对端口；尚未关闭 Edge。") from exc
+
+
+def get_sidebar_eligibility(timeout=6, proxy=None, direct=False):
+    """Anonymous, bounded status request. Never retain identity fields or cookies."""
+    request = urllib.request.Request(SIDEBAR_STATUS_URL,
+                                     headers={"User-Agent": "EdgeCopilotDiagnostics/" + VERSION,
+                                              "Accept": "application/json"})
+    try:
+        if proxy:
+            validate_edge_proxy(proxy)
+            curl = shutil.which("curl.exe" if os.name == "nt" else "curl")
+            if not curl:
+                return {}, "未找到 curl，无法进行 SOCKS5 资格检查；Edge 代理启动不依赖 curl"
+            # Ignore curlrc and environment proxy bypasses. DNS is resolved by SOCKS5.
+            command = [curl, "--disable", "--silent", "--max-time", str(timeout),
+                       "--max-filesize", "65536", "--noproxy", "", "--proxy",
+                       proxy.replace("socks5://", "socks5h://", 1),
+                       "--user-agent", "EdgeCopilotDiagnostics/" + VERSION,
+                       "--header", "Accept: application/json", SIDEBAR_STATUS_URL]
+            result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                    timeout=timeout + 2,
+                                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+            if result.returncode:
+                return {}, "SOCKS5 资格检查失败（curl 退出码 {}），不代表地区资格为否".format(result.returncode)
+            raw = result.stdout
+        else:
+            handlers = [NoNetworkRedirect()]
+            if direct:
+                handlers.append(urllib.request.ProxyHandler({}))
+            opener = urllib.request.build_opener(*handlers)
+            with opener.open(request, timeout=timeout) as response:
+                raw = response.read(65537)
+        if len(raw) > 65536:
+            return {}, "资格响应超过 64 KiB，未解析"
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            return {}, "资格响应不是预期的 JSON 对象"
+        flags = {key: data[key] for key in SIDEBAR_STATUS_KEYS if type(data.get(key)) is bool}
+        if not flags:
+            return {}, "资格响应缺少已知布尔字段，不能判断；未猜测新版结构"
+        return flags, None
+    except urllib.error.HTTPError as exc:
+        code = exc.code
+        exc.close()
+        return {}, "资格接口 HTTP {}，未取得资格结果；不跟随登录或其他重定向".format(code)
+    except (urllib.error.URLError, OSError, subprocess.TimeoutExpired):
+        return {}, "资格请求失败；请核对网络和代理，未取得资格结果"
+    except (ValueError, UnicodeError, RecursionError):
+        return {}, "资格响应不是有效 JSON，不能判断"
+
+
+def show_sidebar_eligibility():
+    print("\n[侧栏地区资格：匿名请求，与浏览器登录会话不同]")
+    print("  " + SIDEBAR_STATUS_URL)
+    flags, error = get_sidebar_eligibility()
+    if error:
+        print("  " + error)
+        return
+    for key in SIDEBAR_STATUS_KEYS:
+        if key in flags:
+            print("  {} = {}".format(key, flags[key]))
+    if any(flags.get(key) is False for key in ("UserIpEligible", "UserRegionEligible")):
+        print("  此匿名请求被服务端判为 IP/地区不合资格；HTTP 200 不等于侧栏可用。")
+        print("  若 copilot.com 能聊天而侧栏不能，请优先核对 Bing 侧栏域名的分流线路。")
+        print("  修改 variations_country 或实验地区启动参数不能覆盖这个服务端返回值。")
+    else:
+        print("  此请求未报告已知的 IP/地区拒绝；不能据此确认侧栏或浏览器账号可用。")
+    if flags.get("UserSignedIn") is False:
+        print("  UserSignedIn=False 是匿名检查的预期情况，不代表 Edge 账号没有登录。")
+
+
+def show_proxy_comparison(proxy):
+    print("\n[同一侧栏资格接口：强制直连 / 本机 SOCKS5 对比]")
+    validate_edge_proxy(proxy)
+    results = []
+    for label, kwargs in (("直连（忽略系统/环境代理）", {"direct": True}),
+                          (proxy, {"proxy": proxy})):
+        flags, error = get_sidebar_eligibility(**kwargs)
+        results.append(flags)
+        print("  {}: {}".format(label, error or ", ".join(
+            "{}={}".format(k, flags[k]) for k in ("UserIpEligible", "UserRegionEligible", "CodexEnabled") if k in flags)))
+    keys = ("UserIpEligible", "UserRegionEligible")
+    if any(results[0].get(k) is False for k in keys) and all(results[1].get(k) is True for k in keys):
+        print("  已确认此接口的地区资格随出口变化：直连被拒，指定代理通过。")
+        print("  可用菜单 8 显式指定 Edge 的启动代理；这仍需在真实侧栏内验证。")
+    print("  对比请求均未携带浏览器登录信息，不能证明 Edge 侧栏当前使用哪条线路。")
+
+
+def show_network_diagnostics():
+    print("\n[网页与侧栏入口连通性：主动联网，无浏览器登录信息]")
+    for url in COPILOT_URLS:
+        print("  {}: {}".format(url, probe_copilot_url(url)))
+    print("  此检查使用 Python 的网络/代理配置，可能与 Edge 的 PAC、扩展、VPN 路由不同。")
+    print("  请在出问题的同一个 Edge 配置中访问上述入口，核对跳转后的域名和具体报错。")
+    print("  网络诊断结果只作提示，不作为自动修改配置或判定聊天恢复的依据。")
+    show_sidebar_eligibility()
+    print("\n[网页可用、侧栏提示地区不可用时]")
+    print("  1. 在代理客户端检查 edgeservices.bing.com、www.bing.com 的实际命中规则和出口。")
+    print("     使用与可正常聊天的 copilot.com 相同的可用线路；规则应排在 Bing/国内直连规则之前。")
+    print("  2. 在出问题的 Edge 配置中打开上述 userstatus 地址，仅核对布尔资格字段。")
+    print("     不要公开完整响应，它可能包含账号信息；Python 检查不等于浏览器会话。")
+    print("  3. 切换线路后关闭并重新打开侧栏；若仍失败，退出并重开 Edge 后复查。")
+    print("  4. 查看 edge://policy 的 EdgeSidebarAppUrlHostBlockList/AllowList；不会自动修改策略。")
+
+
+def show_chat_diagnostics(data):
+    browser = data.get("browser", {})
+    v2 = browser.get("chat_v2", {})
+    ip = v2.get("ip_eligibility_status", {}) if isinstance(v2, dict) else None
+    if isinstance(ip, dict):
+        checked = ip.get("last_checked_time")
+        if checked is not None:
+            print("    chat_v2 IP 资格检查时间已存在（时间戳不是资格开关，保留原样）。")
+    elif "chat_v2" in browser:
+        print("    chat_v2 结构未知，保留原样；不会猜测或新建资格字段。")
+    copilot = data.get("edge_copilot", {})
+    eligible = copilot.get("msa_eligibility_info", {}) if isinstance(copilot, dict) else {}
+    if isinstance(eligible, dict) and "isCopilotEligible" in eligible:
+        value = eligible["isCopilotEligible"]
+        print("    本地 MSA 资格缓存 = {}（只读，不能证明服务端可用）".format(
+            repr(value) if type(value) is bool else "<未知类型>"))
+        if value is False:
+            print("    账号资格缓存为否；请检查 Edge 登录状态、账号及服务地区，脚本不会伪造账号资格。")
+    if browser.get("chat_ip_eligibility_status") is True and browser.get("show_discover_toolbar_button") is True:
+        print("    入口开关已满足。若按钮存在但聊天不可用，请用菜单 7 检查服务入口，并核对登录状态。")
 
 
 def collect_plans(root, country, selected_profiles=None, patch_seed=False):
@@ -779,13 +1011,7 @@ def collect_plans(root, country, selected_profiles=None, patch_seed=False):
                 print("  [{}] chat_ip_eligibility_status={!r}, show_discover_toolbar_button={!r}".format(
                     path.parent.name, browser.get("chat_ip_eligibility_status", MISSING),
                     browser.get("show_discover_toolbar_button", MISSING)))
-                copilot = data.get("edge_copilot", {})
-                eligible = copilot.get("msa_eligibility_info", {}) if isinstance(copilot, dict) else {}
-                if isinstance(eligible, dict) and "isCopilotEligible" in eligible:
-                    print("    本地 MSA 资格缓存 = {!r}（只读，不能证明服务端可用）".format(
-                        eligible["isCopilotEligible"]))
-                if not changes:
-                    print("    这两个配置开关已满足；还需结合地区种子、策略和服务端资格判断。")
+                show_chat_diagnostics(data)
             for key, old, new in changes:
                 print("    待修改 {}: {!r} -> {!r}".format(key, old, new))
             plans.append((path, raw, updated, changes))
@@ -800,8 +1026,9 @@ def troubleshooting():
     print("  1. Edge 147+ 查看 edge://settings/ai；旧入口为")
     print("     edge://settings/appearance/copilotAndSidebar，检查显示 Copilot 按钮。")
     print("  2. 查看 edge://policy 的 Copilot/侧边栏/扩展限制。脚本不会覆盖组织策略。")
-    print("  3. 在同一个 Edge 配置中访问 https://copilot.microsoft.com/，确认账号与网络可用。")
-    print("  4. 重启后再运行 --diagnose，检查配置是否被 Edge 改回。")
+    print("  3. 在同一个 Edge 配置中访问 https://copilot.com/，确认登录与聊天可用；留意跳转域名。")
+    print("     网页正常但侧栏提示地区不可用：菜单 7 / --check-network 检查侧栏 userstatus 和 Bing 分流。")
+    print("  4. 重启后再运行 --diagnose，检查配置是否被 Edge 改回；反复回写可尝试菜单 6。")
     print("  本地写入验证不等于 Copilot 恢复；服务端地区、账号资格和网络不能靠 JSON 保证。")
 
 
@@ -842,11 +1069,20 @@ def build_restart_commands(args, roots):
             command = [str(executable), "--user-data-dir=" + str(root.resolve()), "--new-window"]
             if profile:
                 command.append("--profile-directory=" + profile)
+            if args.startup_country:
+                command.append("--variations-override-country=" + args.country.lower())
+            if args.edge_proxy:
+                command.append("--proxy-server=" + args.edge_proxy)
             commands.append(command)
     return commands
 
 
 def restart_edge(commands):
+    use_country = any(any(arg.startswith("--variations-override-country=") for arg in command)
+                      for command in commands)
+    use_proxy = any(any(arg.startswith("--proxy-server=") for arg in command) for command in commands)
+    if (use_country or use_proxy) and edge_processes():
+        raise RuntimeError("带参数启动前 Edge 又在运行，已停止启动；请完全退出后重试，避免参数被旧实例忽略。")
     for command in commands:
         try:
             subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -855,6 +1091,14 @@ def restart_edge(commands):
         except OSError as exc:
             raise RuntimeError("配置处理已完成，但重新打开 Edge 失败：{}".format(exc)) from exc
     print("已发送 Edge 打开窗口请求（{} 个）。".format(len(commands)))
+    if use_country:
+        print("本次启动已传入实验地区参数；可在 edge://version 的命令行中核对。")
+        print("参数只对这次浏览器进程生效；完全退出后从普通快捷方式打开不会继承。")
+        print("它不改变网络出口或服务端资格，也不阻止磁盘缓存后续回写。")
+    if use_proxy:
+        print("已为本次 Edge 进程传入 SOCKS5 代理，作用于该进程的浏览器网络请求，不仅是 Copilot。")
+        print("该参数不保存到快捷方式。代理扩展或组织策略仍可能覆盖它；可在 edge://version 核对参数。")
+        print("请在同一 Edge 配置打开侧栏 userstatus 地址验证实际线路，然后重新打开 Copilot 侧栏。")
 
 
 def menu_choice(prompt, choices, default=None):
@@ -872,14 +1116,18 @@ def interactive_menu():
     description = "正式版 / Default"
     try:
         while True:
-            print("\n========== Edge Copilot 修复工具 ==========\n当前配置：{}".format(description))
+            print("\n========== Edge Copilot 修复工具 v{} ==========\n当前配置：{}".format(VERSION, description))
             print("1. 修复 Copilot（自动关闭 Edge）")
             print("2. 预览修复内容")
             print("3. 只读诊断")
             print("4. 查看 Edge 进程")
             print("5. 更换浏览器通道 / 配置目录")
+            print("6. 修复并带目标地区启动（自动关闭并重开 Edge，用于地区反复回写）")
+            print("7. 网页/侧栏连通性与地区资格诊断（主动联网，只读）")
+            print("8. 修复并通过本机 SOCKS5 代理重开 Edge（默认端口 10808）")
+            print("9. 对比直连与本机 SOCKS5 的侧栏地区资格（只读）")
             print("0. 退出")
-            choice = menu_choice("请选择操作 [0-5]：", ("0", "1", "2", "3", "4", "5"))
+            choice = menu_choice("请选择操作 [0-9]：", tuple("0123456789"))
             if choice == "0":
                 return 0
             if choice == "5":
@@ -901,7 +1149,25 @@ def interactive_menu():
                     target.extend(["--profile", profile])
                 description += " / " + ("全部配置" if profile == "*" else profile)
                 continue
-            if choice == "1":
+            if choice in ("8", "9"):
+                proxy = input("本机 SOCKS5 地址 [默认 {}]：".format(DEFAULT_EDGE_PROXY)).strip() or DEFAULT_EDGE_PROXY
+                try:
+                    validate_edge_proxy(proxy)
+                except ValueError as exc:
+                    print(str(exc))
+                    continue
+                if choice == "8":
+                    print("请保存网页工作；将关闭并重开 Edge，本次浏览器网络请求将使用指定代理。")
+                    arguments = ["--apply", "--patch-seed", "--close-edge", "--restart-edge",
+                                 "--startup-country", "--edge-proxy", proxy] + target
+                else:
+                    arguments = ["--check-network", "--edge-proxy", proxy]
+            elif choice == "6":
+                print("将关闭并重开 Edge，请先保存网页工作。实验地区参数仅本次启动生效，不改变网络地区。")
+                arguments = ["--apply", "--patch-seed", "--close-edge", "--restart-edge", "--startup-country"] + target
+            elif choice == "7":
+                arguments = ["--check-network"]
+            elif choice == "1":
                 print("修复会关闭 Edge，请先保存网页中的工作。")
                 reopen = menu_choice("修复成功后重新打开 Edge 窗口？[Y/n]：", ("y", "n"), "y")
                 arguments = ["--apply", "--patch-seed", "--close-edge"] + target
@@ -913,6 +1179,11 @@ def interactive_menu():
             else:
                 arguments = ["--list-processes"]
             status = main(arguments)
+            if status == 3 and "--apply" in arguments and "--close-edge" in arguments:
+                print("正常关闭后仍有 Edge 残留。强制关闭会结束当前用户的全部 Edge，可能丢失未保存网页内容。")
+                retry = menu_choice("已保存工作，强制关闭并重试本次操作？[y/N]：", ("y", "n"), "n")
+                if retry == "y":
+                    status = main(arguments + ["--force-close"])
             print("\n操作完成。" if status == 0 else "\n操作未完成，请查看上方错误信息。")
             input("按回车返回菜单……")
     except EOFError:
@@ -930,6 +1201,8 @@ def parse_args(argv=None):
     action.add_argument("--dry-run", action="store_true", help="预览修改，不关闭 Edge、不写文件")
     action.add_argument("--apply", action="store_true", help="备份后应用本地配置补丁")
     action.add_argument("--list-processes", action="store_true", help="只读列出本用户活动 Edge 进程的 PID/类型")
+    action.add_argument("--check-network", action="store_true", help="只读联网检查网页/侧栏入口及匿名地区资格；不使用浏览器登录信息")
+    parser.add_argument("--version", action="version", version="%(prog)s " + VERSION)
     parser.add_argument("--channel", choices=("stable", "beta", "dev", "canary", "all"), default="stable")
     parser.add_argument("--user-data-dir", type=Path, help="自定义 User Data 目录；覆盖 --channel")
     parser.add_argument("--profile", action="append", help="只处理指定配置，可重复；默认所有常规配置")
@@ -942,6 +1215,8 @@ def parse_args(argv=None):
     reopen.add_argument("--no-restart-edge", dest="restart_edge", action="store_false", help="结束后不打开 Edge（命令行默认）")
     parser.set_defaults(restart_edge=False)
     parser.add_argument("--edge-exe", type=Path, help="重新打开时使用的 Edge 可执行文件路径（默认自动查找）")
+    parser.add_argument("--startup-country", action="store_true", help="重开时传入 --country 对应的实验地区；需 --apply --restart-edge，仅本次进程生效")
+    parser.add_argument("--edge-proxy", help="本机 SOCKS5 地址；配合 --apply --restart-edge 启动代理，或 --check-network 对比资格")
     args = parser.parse_args(argv)
     if (args.close_edge or args.force_close) and not args.apply:
         parser.error("关闭浏览器选项只能与 --apply 一起使用")
@@ -949,10 +1224,16 @@ def parse_args(argv=None):
         parser.error("--force-close 必须与 --close-edge 一起使用")
     if args.restart_edge and not args.apply:
         parser.error("--restart-edge 只能与 --apply 一起使用")
+    if args.startup_country and not (args.apply and args.restart_edge):
+        parser.error("--startup-country 必须与 --apply --restart-edge 一起使用")
+    if args.edge_proxy and not (args.check_network or (args.apply and args.restart_edge)):
+        parser.error("--edge-proxy 需要 --check-network 或 --apply --restart-edge")
     if args.edge_exe and args.channel == "all" and not args.user_data_dir:
         parser.error("指定 --edge-exe 时请选择单一通道或自定义 User Data 目录")
     try:
         args.country = validate_country(args.country)
+        if args.edge_proxy:
+            args.edge_proxy = validate_edge_proxy(args.edge_proxy)
     except ValueError as exc:
         parser.error(str(exc))
     return args
@@ -964,6 +1245,11 @@ def main(argv=None):
         return interactive_menu()
     args = parse_args(arguments)
     try:
+        if args.check_network:
+            show_network_diagnostics()
+            if args.edge_proxy:
+                show_proxy_comparison(args.edge_proxy)
+            return 0
         if args.list_processes:
             processes = edge_processes()
             print(describe_edge_processes(processes) if processes else "当前用户没有活动的 Edge 浏览器进程。")
@@ -979,7 +1265,9 @@ def main(argv=None):
             roots = [p for p in roots if p.is_dir()]
         if not roots or any(not p.is_dir() for p in roots):
             raise FileNotFoundError("未找到 Edge 用户数据目录。可用 --user-data-dir 指定 edge://version 显示的配置路径的上一级。")
-        print("模式：{}；目标地区缓存：{}".format("应用补丁" if args.apply else "只读预览/诊断", args.country))
+        print("工具 v{}；模式：{}；目标地区缓存：{}".format(VERSION, "应用补丁" if args.apply else "只读预览/诊断", args.country))
+        if args.startup_country or args.edge_proxy:
+            print("本次将完全退出 Edge 后带地区/代理参数重开，即使配置已满足也需要重新启动。")
         show_system_diagnostics()
         plans, errors = [], []
         for root in roots:
@@ -994,13 +1282,15 @@ def main(argv=None):
         changed = [p for p in plans if p[3]]
         # 关闭浏览器或修改文件前先确认重开所需的可执行文件存在。
         restart_commands = build_restart_commands(args, roots) if args.restart_edge else []
+        if args.edge_proxy:
+            check_socks_proxy(args.edge_proxy)
         print("\n共检查 {} 个文件，{} 个文件需要修改。".format(len(plans), len(changed)))
         if not args.apply:
             flags = "--apply --patch-seed" if args.patch_seed else "--apply"
             print("未写入配置。保存网页工作并退出 Edge 后，使用 {} 应用补丁（保留原路径/配置选择参数）。".format(flags))
             troubleshooting()
             return 0
-        if not changed:
+        if not changed and not (args.startup_country or args.edge_proxy):
             print("本地配置已满足，无需写入，也不会关闭 Edge。")
             troubleshooting()
             if restart_commands:
@@ -1040,6 +1330,9 @@ def main(argv=None):
         else:
             print("本次不自动打开 Edge；可稍后手动打开验证 Copilot。")
         return 0
+    except EdgeStillRunningError as exc:
+        print("错误：{}".format(exc), file=sys.stderr)
+        return 3
     except (OSError, ValueError, RuntimeError) as exc:
         print("错误：{}".format(exc), file=sys.stderr)
         return 1

@@ -8,6 +8,60 @@ Diagnose and repair local Microsoft Edge settings that affect the visibility of 
 
 The script handles both legacy JSON settings and country metadata in the newer `VariationsSeedV2` file. It has restored the Copilot entry point on Windows with Edge **153.0.4234.32**. Results may differ across browser versions, accounts, and network environments.
 
+## v2.1.0: web chat works, but the sidebar reports a region restriction
+
+The web and sidebar use different entry points. Microsoft documents `https://edgeservices.bing.com/edgesvc/shell` for the consumer sidebar. The installed Edge 153 binary also contains the `https://edgeservices.bing.com/edgesvc/userstatus` eligibility endpoint. [Microsoft sidebar troubleshooting](https://learn.microsoft.com/en-us/troubleshoot/microsoft-edge/experience/copilot-chat-loading-issues)
+
+Anonymous requests to the same endpoint returned `UserIpEligible=False` and `UserRegionEligible=False` on a direct connection, and both True through the local v2rayN SOCKS5 proxy at `127.0.0.1:10808`. This confirms that eligibility changes with the request route. It does not measure the live sidebar's route or prove a SwitchyOmega defect. Proxy settings controlled by an extension may differ from other network contexts.
+
+For a v2rayN + SwitchyOmega setup where web chat works:
+
+1. Start v2rayN with the node that works for web chat.
+2. Run the script and select **`9`**. Press Enter to accept `socks5://127.0.0.1:10808` and compare direct/proxy eligibility.
+3. Save your browser work and select **`8`**. Accept the proxy address. The script verifies the SOCKS5 handshake, repairs the local settings, and restarts Edge with `--proxy-server=socks5://127.0.0.1:10808` and the experiment-country argument. If closure fails, the menu offers an explicit force retry.
+4. In the affected Edge profile, open `https://edgeservices.bing.com/edgesvc/userstatus`, check the two region flags, and reopen the sidebar. **Do not publish the entire browser response**, which may contain account information.
+
+The launch proxy affects browser network requests in this Edge process, not just Copilot. It does not edit system proxy settings, v2rayN, SwitchyOmega, or shortcuts. After fully exiting, an ordinary shortcut will not inherit it. Policies or proxy extensions may affect the effective setting; seeing the argument in `edge://version` does not prove the actual route. If needed, temporarily disable the proxy extension for comparison, then restore it. [Chromium proxy configuration](https://chromium.googlesource.com/chromium/src/+/HEAD/net/docs/proxy.md)
+
+Menu **`7`** now includes the sidebar shell and anonymous eligibility checks. `UserSignedIn=False` is expected for an anonymous request and does not mean the browser is signed out. This is not a stable public API: only known boolean fields are recognized, and unfamiliar responses are reported as unknown. Server-returned eligibility is never patched to True.
+
+Automation:
+
+```powershell
+# Read-only direct/proxy comparison
+python patch_edge_copilot.py --check-network --edge-proxy socks5://127.0.0.1:10808
+
+# Repair and restart with explicit proxy and experiment-country arguments
+python patch_edge_copilot.py --apply --patch-seed --profile Default --close-edge --restart-edge --startup-country --edge-proxy socks5://127.0.0.1:10808
+```
+
+Only local SOCKS5 proxies without authentication are supported: `127.0.0.1`, `localhost`, or `[::1]`, with a port. The SOCKS5 eligibility probe requires an available `curl` executable; launching Edge with the proxy does not. No new Python dependencies were added. **Proxy requests passed the region eligibility check; actual sidebar chat restoration still requires user validation.**
+
+## v2.0.0 update (2026-09-23)
+
+Adds diagnostics and recovery options for Edge **153.0.4234.48** when the button appears but chat is unavailable, or background processes remain after closing windows:
+
+- **Force retry inside the menu:** if normal shutdown fails, enter `y` to force closure and retry with the same channel, profile, and reopening choices. The default is `N`. Configuration errors do not trigger this prompt.
+- **Menu `6`: repair and launch with a country override.** After repairing local files, launch a fresh process with `--variations-override-country=us` (use CLI `--country` for another country). Existing processes must exit even when files already match the target.
+- **Menu `7`: chat endpoint connectivity checks.** Check `copilot.com`, `copilot.microsoft.com`, and `copilot.cloud.microsoft`; distinguish DNS, TLS, timeout, HTTP errors, and redirects. No browser login information is sent, response bodies are not read, and redirects are not followed.
+- **Eligibility diagnostics:** distinguish toolbar preferences, the MSA eligibility cache, and the `chat_v2` check timestamp. The timestamp is not treated as a boolean switch, and account eligibility is not modified.
+
+The local investigation found both toolbar preferences and MSA eligibility set to True, while `Local State` and `VariationsSeedV2.session_country` had returned to CN. Active renderer processes also remained with no visible windows. These are confirmed local observations; **they do not establish the server-side cause of unavailable chat, and successful chat restoration with this release has not been verified**.
+
+The launch flag comes from Chromium's experiment assignment logic and **only affects this browser process**. After fully exiting, an ordinary shortcut will not inherit it. It does not prevent cache files from being rewritten or change your network location, account region, or server eligibility. Inspect `edge://version` to confirm the argument was passed. [Chromium country selection logic](https://github.com/chromium/chromium/blob/main/components/variations/service/variations_field_trial_creator.cc)
+
+For an existing button with unavailable chat, start with menu `7` and test chat at `https://copilot.com/` in the affected Edge profile. Try menu `6` if country caches keep reverting. Microsoft's current documentation also lists `copilot.cloud.microsoft`, so check connectivity to the actual redirect destination. [Microsoft Copilot entry points](https://support.microsoft.com/en-us/microsoft-365-copilot/what-is-microsoft-copilot-app)
+
+Equivalent automation commands:
+
+```powershell
+python patch_edge_copilot.py --apply --patch-seed --profile Default --close-edge --restart-edge --startup-country
+python patch_edge_copilot.py --check-network
+python patch_edge_copilot.py --version
+```
+
+Automation still requires explicit `--force-close` to force termination; CLI execution never asks for confirmation. Forced closure now stops browser roots before children and rechecks newly created processes. **Save your work first: forced termination can lose unsaved page content.**
+
 ## Contents
 
 - [Features](#features)
@@ -87,15 +141,19 @@ Opening the menu does not change any settings. Writes are attempted only when yo
 The program's menu, prompts, and most diagnostic messages are currently in Chinese. The following is an English translation of the menu for reference; this README does not add an English interface to the program.
 
 ```text
-========== Edge Copilot Repair Tool ==========
+========== Edge Copilot Repair Tool v2.1.0 ==========
 Current target: Stable / Default
 1. Repair Copilot (close Edge automatically)
 2. Preview repair changes
 3. Read-only diagnostics
 4. List Edge processes
 5. Change browser channel / profile directory
+6. Repair and launch with a country override (close and reopen Edge)
+7. Web/sidebar connectivity and region eligibility checks (read-only)
+8. Repair and reopen Edge through local SOCKS5 (default port 10808)
+9. Compare direct and local SOCKS5 sidebar region eligibility (read-only)
 0. Exit
-Select an action [0-5]:
+Select an action [0-9]:
 ```
 
 | Option | Behavior |
@@ -105,6 +163,10 @@ Select an action [0-5]:
 | `3` | Inspect settings without changing them; on Windows, also check relevant registry policies and proxy configuration status |
 | `4` | List active Edge processes belonging to the current user to help identify background processes |
 | `5` | Choose a channel or custom User Data directory, then specify a profile directory name |
+| `6` | Repair and fully restart Edge with an experiment country argument that applies only to the new process; always requests reopening |
+| `7` | Check web/sidebar endpoints and selected anonymous eligibility flags without accessing browser configuration |
+| `8` | Verify the local SOCKS5 handshake, repair, and restart Edge with the proxy |
+| `9` | Run network diagnostics and compare anonymous eligibility with forced direct and SOCKS5 requests |
 | `0` | Exit |
 
 Press Enter after an operation to return to the menu. Your target selection lasts only for the current run; it is not saved in an extra settings file.
@@ -115,7 +177,7 @@ When choosing a profile directory:
 - Enter a directory name such as `Profile 1` to process only that profile's `Preferences`.
 - Enter `*` to process all existing regular profiles in the selected user data directory.
 
-Use the **directory name on disk**, not the account nickname shown in Edge. The menu does not enable `--force-close` by default.
+Use the **directory name on disk**, not the account nickname shown in Edge. The menu does not enable `--force-close` by default; enter `y` after a shutdown failure to force a retry. Regular repair option `1` still lets you choose not to reopen Edge.
 
 ## Command-line usage
 
@@ -203,6 +265,15 @@ Without `--patch-seed`, the standalone seed file is not modified. On versions th
 
 ## Argument reference
 
+New in v2:
+
+| Argument | Behavior |
+| --- | --- |
+| `--version` | Print the tool version and exit |
+| `--check-network` | Check web/sidebar endpoints and anonymous eligibility; requires no local Edge profile. Exit code 0 means the checks completed, not that chat works |
+| `--edge-proxy` | Local SOCKS5 URL, e.g. `socks5://127.0.0.1:10808`; use with `--check-network` for comparison, or `--apply --restart-edge` to launch Edge with the proxy |
+| `--startup-country` | Add the experiment country argument on launch; requires `--apply --restart-edge`. Running Edge processes also require `--close-edge` or manual shutdown |
+
 | Argument | Purpose | Default / notes |
 | --- | --- | --- |
 | `-h`, `--help` | Show help and exit | Does not repair anything |
@@ -223,11 +294,11 @@ Without `--patch-seed`, the standalone seed file is not modified. On versions th
 
 Combination rules:
 
-- `--diagnose`, `--dry-run`, `--apply`, and `--list-processes` are mutually exclusive.
+- `--diagnose`, `--dry-run`, `--apply`, `--list-processes`, and `--check-network` are mutually exclusive.
 - `--restart-edge` and `--no-restart-edge` are mutually exclusive.
 - `--close-edge`, `--force-close`, and `--restart-edge` cannot be used with read-only actions.
 - Without a custom User Data directory, `--edge-exe` cannot be combined with `--channel all`.
-- `--country` changes only local cache values, not your actual network location or account region.
+- `--country` selects the target for local caches and the optional launch flag, not your actual network location or account region.
 
 ## Automation
 
@@ -271,6 +342,7 @@ Use the account that normally runs Edge, and execute in that user's interactive 
 | `0` | The operation completed, or no settings needed to change |
 | `1` | A configuration read, process operation, write, or browser launch failed |
 | `2` | Invalid command-line arguments |
+| `3` | Edge shutdown could not be confirmed; no configuration was written. The menu can offer a force retry |
 | `130` | The interactive menu was interrupted with Ctrl+C |
 
 Exit code `0` means the script completed; it does not guarantee that the Copilot service is available. The menu's exit code describes the menu session, not the result of every repair performed within it. Use argument-based execution for automation.
@@ -323,6 +395,8 @@ On Windows, if only background instances explicitly started with `--no-startup-w
 
 If page renderers, extension pages, headless automation, or unknown process types remain, the script does not automatically force termination. Instead, it lists their PIDs and process types. Check these in Task Manager's **Details** tab.
 
+A renderer may belong to a background page or extension, not necessarily a visible tab. After normal shutdown fails, v2 offers a force retry in the menu, defaulting to no. Save your work and enter `y` to retry while keeping the same profile and reopening choices.
+
 **Shutdown applies to all Edge browser processes owned by the current user, including other channels; it is not limited by `--profile`.** To avoid having the script close browsers, fully exit Edge manually and omit `--close-edge`.
 
 If you have saved your work and need to force shutdown:
@@ -338,6 +412,7 @@ Forced termination may lose unsaved page content and does not guarantee that nor
 - Menu repair asks whether to reopen Edge and defaults to yes. Command-line mode defaults to leaving it closed.
 - Reopening uses the selected channel, user data directory, and profile. Specifying multiple distinct `--profile` values sends a separate window-opening request for each.
 - If settings already match the target, `--restart-edge` still requests a window even though no repair is needed.
+- With `--startup-country` or `--edge-proxy`, existing processes must exit even if settings already match, so launch flags are not ignored by an existing instance. A process reappearing before launch aborts the launch with an error.
 - Repair failures do not automatically reopen Edge. If only the browser launch fails, configuration changes may already have completed; the output explains this.
 - Opening a window does not guarantee restoration of all previous tabs. Session restoration depends on Edge's own settings.
 - The script reports that a launch request was sent. It does not automatically verify that a window appeared or that Copilot responded.
@@ -440,10 +515,10 @@ Specify the actual executable with `--edge-exe`. For a custom Beta or Dev data d
 If you also downloaded the test files from the repository, run:
 
 ```powershell
-python -m unittest -v test_patch_edge_copilot.py test_edge_copilot_seed.py test_edge_shutdown.py test_edge_menu.py
+python -m unittest -v test_patch_edge_copilot.py test_edge_copilot_seed.py test_edge_shutdown.py test_edge_menu.py test_edge_v2.py test_edge_sidebar.py
 ```
 
-The current implementation has passed **80 automated tests** covering field preservation, malformed-file protection, backups, concurrent-change checks, seed parsing, process shutdown, menus, and reopening. Automated tests use temporary configurations and simulated processes; they do not operate real Edge windows.
+The current implementation has passed **116 automated tests** covering field preservation, malformed-file protection, backups, concurrent-change checks, seed parsing, process shutdown, menu force retries, country/proxy launches, SOCKS5 handshakes, and anonymous eligibility parsing. Automated tests use temporary configurations, simulated processes, and mocked network responses; they do not operate real Edge windows.
 
 The main script has also been copied alone into an isolated temporary directory and verified for menu operation, preview, and simulated configuration repair. Test files are not runtime dependencies.
 
